@@ -1,0 +1,95 @@
+name: Cantonese Transcribe
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    if: github.event.issue.title == 'RUN_CANTONESE_TRANSCRIBE'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Publish one-time public key
+        run: |
+          set -eu
+          mkdir -p transcription_exchange
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /tmp/private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/private.pem -pubout -out transcription_exchange/public.pem >/dev/null 2>&1
+          printf '{"state":"waiting"}\n' > transcription_exchange/status.json
+          git config user.name transcription-bot
+          git config user.email transcription-bot@users.noreply.github.com
+          git add transcription_exchange/public.pem transcription_exchange/status.json
+          git commit -m 'Publish one-time public key'
+          git push
+
+      - name: Wait for encrypted input
+        run: |
+          set -eu
+          i=0
+          while [ $i -lt 240 ]; do
+            git pull --rebase >/dev/null 2>&1 || true
+            if [ -s transcription_exchange/request.json ] && [ -s transcription_exchange/audio.enc ]; then
+              exit 0
+            fi
+            i=$((i+1))
+            sleep 5
+          done
+          exit 1
+
+      - name: Decrypt input
+        run: |
+          set -eu
+          base64 -d transcription_exchange/key.enc.b64 > /tmp/key.enc
+          openssl pkeyutl -decrypt -inkey /tmp/private.pem -in /tmp/key.enc -out /tmp/aes.key -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          KEYHEX=$(od -An -tx1 -v /tmp/aes.key | tr -d ' \n')
+          IVHEX=$(python -c "import json; print(json.load(open('transcription_exchange/request.json'))['input_iv'])")
+          openssl enc -d -aes-256-cbc -K "$KEYHEX" -iv "$IVHEX" -in transcription_exchange/audio.enc -out /tmp/input.mp3
+
+      - name: Install recognizer
+        run: python -m pip install --quiet faster-whisper
+
+      - name: Transcribe
+        run: |
+          cat > /tmp/transcribe.py <<'PY'
+          import json
+          from faster_whisper import WhisperModel
+          model = WhisperModel('small', device='cpu', compute_type='int8')
+          segments, info = model.transcribe(
+              '/tmp/input.mp3', language='zh', beam_size=5, vad_filter=True,
+              word_timestamps=True, condition_on_previous_text=True,
+              initial_prompt='香港粵語口語對話。可能談及數字、人工智能、宗教、耶和華、神、完美、朋友、理解、測試及感情。請忠實轉錄原話。'
+          )
+          data=[]
+          lines=[]
+          for s in segments:
+              data.append({'start':s.start,'end':s.end,'text':s.text.strip(),'avg_logprob':getattr(s,'avg_logprob',None),'no_speech_prob':getattr(s,'no_speech_prob',None)})
+              lines.append(f'[{s.start:07.2f} --> {s.end:07.2f}] {s.text.strip()}')
+          open('/tmp/transcript.txt','w',encoding='utf-8').write('\n'.join(lines)+'\n')
+          json.dump({'language':info.language,'language_probability':info.language_probability,'segments':data},open('/tmp/segments.json','w',encoding='utf-8'),ensure_ascii=False,indent=2)
+          PY
+          python /tmp/transcribe.py
+          test -s /tmp/transcript.txt
+
+      - name: Encrypt and publish result
+        run: |
+          set -eu
+          cd /tmp
+          zip -q result.zip transcript.txt segments.json
+          KEYHEX=$(od -An -tx1 -v /tmp/aes.key | tr -d ' \n')
+          OUTIV=$(openssl rand -hex 16)
+          openssl enc -aes-256-cbc -K "$KEYHEX" -iv "$OUTIV" -in /tmp/result.zip -out "$GITHUB_WORKSPACE/transcription_exchange/result.enc"
+          cd "$GITHUB_WORKSPACE"
+          printf '{"state":"complete","output_iv":"%s"}\n' "$OUTIV" > transcription_exchange/result.json
+          printf '{"state":"complete"}\n' > transcription_exchange/status.json
+          git pull --rebase >/dev/null 2>&1 || true
+          git add transcription_exchange/result.enc transcription_exchange/result.json transcription_exchange/status.json
+          git commit -m 'Publish encrypted transcript'
+          git push
