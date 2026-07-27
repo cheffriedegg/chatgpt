@@ -1,0 +1,122 @@
+name: Cantonese Transcribe V2
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  transcribe:
+    if: github.event.issue.title == 'RUN_CANTONESE_TRANSCRIBE_V2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Publish temporary public key
+        run: |
+          set -euo pipefail
+          mkdir -p transcription_exchange_v2
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /tmp/private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/private.pem -pubout -out transcription_exchange_v2/public.pem >/dev/null 2>&1
+          printf '{"state":"waiting"}\n' > transcription_exchange_v2/status.json
+          git config user.name transcription-bot
+          git config user.email transcription-bot@users.noreply.github.com
+          git add transcription_exchange_v2/public.pem transcription_exchange_v2/status.json
+          git commit -m 'Publish temporary transcription key v2'
+          git push
+
+      - name: Wait for encrypted request
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 240); do
+            git pull --rebase >/dev/null 2>&1 || true
+            if [ -s transcription_exchange_v2/request.json ]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Rebuild encrypted audio from git blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          : > /tmp/audio.enc
+          for sha in $(jq -r '.chunks[]' transcription_exchange_v2/request.json); do
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/blobs/${sha}" | jq -r '.content' | tr -d '\n' | base64 -d >> /tmp/audio.enc
+          done
+          jq -r '.encrypted_key_b64' transcription_exchange_v2/request.json | base64 -d > /tmp/key.enc
+          openssl pkeyutl -decrypt -inkey /tmp/private.pem -in /tmp/key.enc -out /tmp/aes.key -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          KEYHEX=$(xxd -p -c 256 /tmp/aes.key)
+          IVHEX=$(jq -r '.input_iv' transcription_exchange_v2/request.json)
+          openssl enc -d -aes-256-cbc -K "$KEYHEX" -iv "$IVHEX" -in /tmp/audio.enc -out /tmp/input.mp3
+          ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 /tmp/input.mp3 > /tmp/duration.txt
+
+      - name: Install recognizer
+        run: python -m pip install --quiet --disable-pip-version-check faster-whisper
+
+      - name: Run two transcription passes
+        run: |
+          cat > /tmp/transcribe.py <<'PY'
+          import json
+          from faster_whisper import WhisperModel
+
+          audio = '/tmp/input.mp3'
+          prompt = '香港粵語口語對話，可能涉及數字、人工智能、記憶體、量子計算、宗教、耶和華、神、完美、朋友、理解、測試、感情和網上認識的女仔。請忠實轉錄原話，不要自行改寫。'
+
+          def run(model_name, out_prefix, beam):
+              model = WhisperModel(model_name, device='cpu', compute_type='int8')
+              segments, info = model.transcribe(
+                  audio,
+                  language='zh',
+                  beam_size=beam,
+                  best_of=beam,
+                  vad_filter=True,
+                  condition_on_previous_text=True,
+                  word_timestamps=True,
+                  initial_prompt=prompt,
+              )
+              rows=[]
+              lines=[]
+              for s in segments:
+                  row={
+                      'start':round(s.start,3),
+                      'end':round(s.end,3),
+                      'text':s.text.strip(),
+                      'avg_logprob':getattr(s,'avg_logprob',None),
+                      'no_speech_prob':getattr(s,'no_speech_prob',None),
+                      'words':[{'start':round(w.start,3) if w.start is not None else None,'end':round(w.end,3) if w.end is not None else None,'word':w.word,'probability':round(w.probability,4)} for w in (s.words or [])]
+                  }
+                  rows.append(row)
+                  lines.append(f'[{s.start:07.2f} --> {s.end:07.2f}] {s.text.strip()}')
+              open(f'/tmp/{out_prefix}.txt','w',encoding='utf-8').write('\n'.join(lines)+'\n')
+              json.dump({'model':model_name,'language':info.language,'language_probability':info.language_probability,'segments':rows},open(f'/tmp/{out_prefix}.json','w',encoding='utf-8'),ensure_ascii=False,indent=2)
+
+          run('small', 'small_pass', 5)
+          run('medium', 'medium_pass', 5)
+          PY
+          python /tmp/transcribe.py >/tmp/transcribe.log 2>&1
+          test -s /tmp/small_pass.txt
+          test -s /tmp/medium_pass.txt
+
+      - name: Encrypt result and publish
+        run: |
+          set -euo pipefail
+          cd /tmp
+          zip -q transcription-result.zip small_pass.txt small_pass.json medium_pass.txt medium_pass.json duration.txt
+          KEYHEX=$(xxd -p -c 256 /tmp/aes.key)
+          OUTIV=$(openssl rand -hex 16)
+          openssl enc -aes-256-cbc -K "$KEYHEX" -iv "$OUTIV" -in /tmp/transcription-result.zip -out "$GITHUB_WORKSPACE/transcription_exchange_v2/result.enc"
+          cd "$GITHUB_WORKSPACE"
+          printf '{"state":"complete","output_iv":"%s"}\n' "$OUTIV" > transcription_exchange_v2/result.json
+          printf '{"state":"complete"}\n' > transcription_exchange_v2/status.json
+          git pull --rebase >/dev/null 2>&1 || true
+          git add transcription_exchange_v2/result.enc transcription_exchange_v2/result.json transcription_exchange_v2/status.json
+          git commit -m 'Publish encrypted Cantonese transcript v2'
+          git push
